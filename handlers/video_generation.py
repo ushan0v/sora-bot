@@ -4,12 +4,11 @@ from io import BytesIO
 
 from aiogram import Router, F
 from aiogram.types import Message
-from aiogram.types.input_file import URLInputFile
 
-from utils.db import get_user_settings, set_active_generation
-from utils.sora_client import generate_video
+from utils.db import enqueue_generation_job, get_user_settings, set_active_generation
+from utils.generation_queue import get_generation_queue
 
-from config import PROXY_URL, ADMIN_ID
+from config import ADMIN_ID
 
 router = Router(name="video_generation")
 
@@ -33,76 +32,42 @@ async def _start_generation(message: Message, prompt: str, image_bytes: Optional
         duration_i = int(duration_sec)
         frames = duration_i * 30
 
-        async for evt in generate_video(
-            prompt,
-            orientation=orientation,
-            image=image_bytes,
+        enqueue_generation_job(
+            user_id=user_id,
+            chat_id=message.chat.id,
+            prompt=prompt,
+            orientation=None if image_bytes is not None else orientation,
             frames=frames,
             size=str(size),
-            poll_interval_sec=3.0,
+            image_bytes=image_bytes,
+            wait_message_id=wait_msg.message_id if wait_msg else None,
+            poll_interval=3.0,
             timeout_sec=900.0,
-            proxy=PROXY_URL,
-        ):
-            et = str(evt.get("event"))
+        )
 
-            if et == "queued" or (et == "progress" and evt.get("status") == "queued"):
-                if wait_msg:
-                    try:
-                        await wait_msg.edit_text("⏳ Генерация скоро начнется...")
-                    except Exception:
-                        pass
-                continue
+        try:
+            queue = get_generation_queue()
+            queue.notify_new_job()
+        except Exception:
+            # If the queue is not initialized we will rely on the next startup to pick the job up
+            pass
 
-            if et == "progress" and evt.get("status") == "rendering":
-                pct = evt.get("progress_pct")
-                if isinstance(pct, (int, float)):
-                    pct_i = int(round(float(pct) * 100))
-                    if wait_msg:
-                        try:
-                            await wait_msg.edit_text(f"🚀 Видео создается. Прогресс: <b>{pct_i}%</b>")
-                        except Exception:
-                            pass
-                continue
-
-            if et == "error":
-                if wait_msg:
-                    try:
-                        await wait_msg.delete()
-                    except Exception:
-                        pass
-                err_msg = evt.get("message") or evt.get("code") or "Неизвестная ошибка"
-                await message.reply(f"<b>🚫 Ошибка генерации:</b>\n<pre>{err_msg}</pre>")
-                return
-
-            if et == "finished":
-                if wait_msg:
-                    try:
-                        await wait_msg.delete()
-                    except Exception:
-                        pass
-
-                url = evt.get("downloadable_url") or evt.get("url")
-                if url:
-                    try:
-                        await message.reply_video(
-                            video=URLInputFile(url),
-                            caption="<b>✅ Видео успешно создано</b>",
-                        )
-                    except Exception as e:
-                        # Fallback: send as a plain link
-                        await message.reply("<b>✅ Видео успешно создано</b>\n\n" + url)
-                else:
-                    await message.reply("❗️Видео успешно создано, но файл не найден в ответе")
-                return
-        # If loop exits without finished or error, treat as unknown failure
+        if wait_msg:
+            try:
+                await wait_msg.edit_text(
+                    "⏳ Ваша генерация поставлена в очередь. Я пришлю обновления сюда.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    except Exception:
+        set_active_generation(user_id, 0)
         if wait_msg:
             try:
                 await wait_msg.delete()
             except Exception:
                 pass
-        await message.reply("<b>🚫 Ошибка генерации:</b>\n<pre>Неизвестное состояние</pre>")
-    finally:
-        set_active_generation(user_id, 0)
+        await message.reply("❗️Не удалось поставить задачу в очередь. Попробуйте позже.")
 
 
 @router.message(F.text & ~F.media_group_id)

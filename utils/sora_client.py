@@ -468,6 +468,7 @@ async def generate_video(
                 return
         selected_acc_id = int(acc["id"])  # type: ignore[index]
         selected_cookies_json = str(acc["cookies_json"])  # type: ignore[index]
+        yield {"event": "account", "account_id": selected_acc_id}
     except Exception as e:
         _dbg("generate_video: account pool unavailable: %s", repr(e))
         yield {"event": "error", "code": "accounts_not_configured", "message": "Пул аккаунтов не настроен"}
@@ -646,196 +647,15 @@ async def generate_video(
     _dbg("generate_video: queued task_id=%s priority=%s", task_id, str(ci.get("priority")))
     yield {"event": "queued", "task_id": task_id, "priority": ci.get("priority")}
 
-    # Step 3: Poll progress and completion
-    # - Progress: GET /backend/nf/pending -> array with our task id and fields
-    #   { status, progress_pct, progress_pos_in_queue, estimated_queue_wait_time, ... }
-    # - Completion and errors: GET /backend/project_y/profile/drafts?limit=15
-    #   our draft appears only when finished or failed; for failures kind == 'sora_error'.
-    start_time = time.time()
-    found_gen_id: Optional[str] = None
-    last_progress_key: Optional[str] = None  # to avoid spamming identical updates
     try:
-        while True:
-            if time.time() - start_time > timeout_sec:
-                yield {"event": "error", "code": "timeout", "message": "Generation timed out"}
-                return
-
-            # 3a) Poll pending for progress (queue position or %)
-            pending_item: Optional[Dict[str, Any]] = None
-            try:
-                _dbg("generate_video: polling pending...")
-                pr = await client.get_json("/backend/nf/pending")
-                if pr.status == 200:
-                    try:
-                        arr = await pr.json()
-                        if isinstance(arr, list):
-                            for it in arr:
-                                if it.get("id") == task_id:
-                                    pending_item = it
-                                    break
-                    except Exception as e:
-                        _dbg("generate_video: pending json parse error: %s", repr(e))
-                else:
-                    _dbg("generate_video: pending status=%d, ignore", pr.status)
-            except Exception as e:
-                _dbg("generate_video: pending request failed: %s", repr(e))
-
-            # Emit progress based on pending first
-            if pending_item:
-                status = (pending_item.get("status") or "").lower()
-                pct = pending_item.get("progress_pct")
-                pos = pending_item.get("progress_pos_in_queue")
-                eta = pending_item.get("estimated_queue_wait_time")
-                msg = pending_item.get("queue_status_message")
-
-                # Immediate failure detection if provided by pending API
-                fail_reason = pending_item.get("failure_reason")
-                if fail_reason or status in ("failed", "error", "canceled"):
-                    reason = str(fail_reason or status or "processing_error")
-                    _dbg("generate_video: pending reported failure: %s", reason)
-                    yield {
-                        "event": "error",
-                        "code": reason,
-                        "message": f"Generation failed: {reason}",
-                        "details": pending_item,
-                        "task_id": task_id,
-                        "gen_id": found_gen_id,
-                    }
-                    return
-
-                # Map server status to our two-phase model: queued or rendering
-                # Consider presence of progress_pct>0 as rendering even if status is preprocessing
-                is_rendering = (status not in ("queued", "preprocessing")) or (isinstance(pct, (int, float)) and pct is not None and float(pct) > 0.0)
-                if not is_rendering:
-                    progress_event = {
-                        "event": "progress",
-                        "status": "queued",
-                        "task_id": task_id,
-                        "queue_position": pos,
-                        "eta_sec": eta,
-                        "message": msg,
-                    }
-                else:
-                    progress_event = {
-                        "event": "progress",
-                        "status": "rendering",
-                        "task_id": task_id,
-                        "progress_pct": pct,
-                        "message": msg,
-                    }
-
-                # De-dup identical messages
-                fingerprint = json.dumps(progress_event, sort_keys=True)
-                if fingerprint != last_progress_key:
-                    last_progress_key = fingerprint
-                    yield progress_event
-
-            else:
-                # If not in pending list at this moment, we keep last known state.
-                # If nothing reported yet, send queued heartbeat to indicate we are waiting.
-                if last_progress_key is None:
-                    yield {"event": "progress", "status": "queued", "task_id": task_id}
-
-            # 3b) Poll drafts for completion or error
-            _dbg("generate_video: polling drafts list ...")
-            r = await client.get_json("/backend/project_y/profile/drafts?limit=15")
-            if r.status == 401:
-                _dbg("generate_video: poll unauthorized (auth expired)")
-                yield {"event": "error", "code": "auth_expired", "message": "Authentication expired while polling"}
-                return
-            if r.status >= 400:
-                err = await _parse_error_resp(r)
-                _dbg("generate_video: poll failed status=%d code=%s msg=%s", r.status, err.get("code"), (err.get("message") or "")[:200])
-                yield {"event": "error", "code": err.get("code") or "poll_failed", "message": err.get("message"), "details": err}
-                return
-
-            try:
-                items = (await r.json()).get("items", [])
-            except Exception:
-                items = []
-
-            my = None
-            for it in items:
-                if it.get("task_id") == task_id:
-                    my = it
-                    break
-
-            if my:
-                # Only print in debug mode
-                _dbg("generate_video: draft entry keys=%s", list(my.keys()))
-                gen_id = my.get("id")
-                if not found_gen_id and gen_id:
-                    found_gen_id = gen_id
-                    _dbg("generate_video: draft found gen_id=%s", found_gen_id)
-                    yield {"event": "draft_found", "gen_id": found_gen_id}
-
-                # Handle explicit/implicit error draft objects
-                # Observed shapes:
-                #  - kind: 'sora_error', error_reason: 'processing_error'
-                #  - reason, reason_str present without url/encodings
-                #  - other *_reason fields
-                draft_has_error = False
-                code_val = None
-                msg_val = None
-                if my.get("kind") == "sora_error":
-                    draft_has_error = True
-                    code_val = my.get("error_reason") or my.get("reason")
-                    msg_val = my.get("reason_str") or my.get("message")
-                if (my.get("error_reason") or my.get("failure_reason") or my.get("reason") or my.get("reason_str")) and not (my.get("url") and my.get("encodings")):
-                    draft_has_error = True
-                    code_val = code_val or my.get("error_reason") or my.get("failure_reason") or my.get("reason")
-                    msg_val = msg_val or my.get("reason_str") or my.get("message")
-
-                if draft_has_error:
-                    reason = str(code_val or "processing_error")
-                    _dbg("generate_video: detected error draft, reason=%s", reason)
-                    yield {
-                        "event": "error",
-                        "code": reason,
-                        "message": (f"Generation failed: {msg_val}" if msg_val else f"Generation failed: {reason}"),
-                        "details": my,
-                        "task_id": task_id,
-                        "gen_id": found_gen_id,
-                    }
-                    return
-
-                # If a URL/encodings present -> finished
-                if my.get("url") and my.get("encodings"):
-                    # Optionally fetch v2 for full details
-                    if found_gen_id:
-                        _dbg("generate_video: fetching draft v2 details for %s", found_gen_id)
-                        v2 = await client.get_json(f"/backend/project_y/profile/drafts/v2/{found_gen_id}")
-                        if v2.status == 200:
-                            d = (await v2.json()).get("draft", {})
-                            _dbg("generate_video: finished (v2) url=%s", d.get("url"))
-                            yield {
-                                "event": "finished",
-                                "gen_id": found_gen_id,
-                                "task_id": task_id,
-                                "url": d.get("url"),
-                                "downloadable_url": d.get("downloadable_url"),
-                                "encodings": d.get("encodings"),
-                                "width": d.get("width"),
-                                "height": d.get("height"),
-                                "prompt": d.get("prompt"),
-                            }
-                            return
-                    # Fallback to current item if v2 missing
-                    _dbg("generate_video: finished (fallback) url=%s", my.get("url"))
-                    yield {
-                        "event": "finished",
-                        "gen_id": found_gen_id,
-                        "task_id": task_id,
-                        "url": my.get("url"),
-                        "downloadable_url": my.get("downloadable_url"),
-                        "encodings": my.get("encodings"),
-                        "width": my.get("width"),
-                        "height": my.get("height"),
-                        "prompt": my.get("prompt"),
-                    }
-                    return
-
-            await asyncio.sleep(poll_interval_sec)
+        async for poll_event in _poll_generation(
+            client,
+            str(task_id),
+            poll_interval_sec=poll_interval_sec,
+            timeout_sec=timeout_sec,
+        ):
+            yield poll_event
+        return
     finally:
         # Close the HTTP session
         if isinstance(client, _AsyncBrowserSession) and client.session and not client.session.closed:
@@ -850,7 +670,275 @@ async def generate_video(
             _dbg("generate_video: failed to mark generation finished: %s", repr(_e))
 
 
+async def _poll_generation(
+    client: _AsyncBrowserSession,
+    task_id: str,
+    *,
+    poll_interval_sec: float,
+    timeout_sec: float,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Shared polling logic used by both fresh and resumed generations."""
+
+    start_time = time.time()
+    found_gen_id: Optional[str] = None
+    last_progress_key: Optional[str] = None
+
+    while True:
+        if timeout_sec > 0 and time.time() - start_time > timeout_sec:
+            yield {
+                "event": "error",
+                "code": "timeout",
+                "message": "Generation timed out",
+                "task_id": task_id,
+            }
+            return
+
+        pending_item: Optional[Dict[str, Any]] = None
+        try:
+            _dbg("poll_generation: polling pending...")
+            pr = await client.get_json("/backend/nf/pending")
+            if pr.status == 200:
+                try:
+                    arr = await pr.json()
+                    if isinstance(arr, list):
+                        for it in arr:
+                            if it.get("id") == task_id:
+                                pending_item = it
+                                break
+                except Exception as e:
+                    _dbg("poll_generation: pending json parse error: %s", repr(e))
+            else:
+                _dbg("poll_generation: pending status=%d, ignore", pr.status)
+        except Exception as e:
+            _dbg("poll_generation: pending request failed: %s", repr(e))
+
+        if pending_item:
+            status = (pending_item.get("status") or "").lower()
+            pct = pending_item.get("progress_pct")
+            pos = pending_item.get("progress_pos_in_queue")
+            eta = pending_item.get("estimated_queue_wait_time")
+            msg = pending_item.get("queue_status_message")
+
+            fail_reason = pending_item.get("failure_reason")
+            if fail_reason or status in ("failed", "error", "canceled"):
+                reason = str(fail_reason or status or "processing_error")
+                _dbg("poll_generation: pending reported failure: %s", reason)
+                yield {
+                    "event": "error",
+                    "code": reason,
+                    "message": f"Generation failed: {reason}",
+                    "details": pending_item,
+                    "task_id": task_id,
+                    "gen_id": found_gen_id,
+                }
+                return
+
+            is_rendering = (status not in ("queued", "preprocessing")) or (
+                isinstance(pct, (int, float))
+                and pct is not None
+                and float(pct) > 0.0
+            )
+            if not is_rendering:
+                progress_event = {
+                    "event": "progress",
+                    "status": "queued",
+                    "task_id": task_id,
+                    "queue_position": pos,
+                    "eta_sec": eta,
+                    "message": msg,
+                }
+            else:
+                progress_event = {
+                    "event": "progress",
+                    "status": "rendering",
+                    "task_id": task_id,
+                    "progress_pct": pct,
+                    "message": msg,
+                }
+
+            fingerprint = json.dumps(progress_event, sort_keys=True)
+            if fingerprint != last_progress_key:
+                last_progress_key = fingerprint
+                yield progress_event
+        else:
+            if last_progress_key is None:
+                yield {"event": "progress", "status": "queued", "task_id": task_id}
+
+        _dbg("poll_generation: polling drafts list ...")
+        r = await client.get_json("/backend/project_y/profile/drafts?limit=15")
+        if r.status == 401:
+            _dbg("poll_generation: poll unauthorized (auth expired)")
+            yield {
+                "event": "error",
+                "code": "auth_expired",
+                "message": "Authentication expired while polling",
+            }
+            return
+        if r.status >= 400:
+            err = await _parse_error_resp(r)
+            _dbg(
+                "poll_generation: poll failed status=%d code=%s msg=%s",
+                r.status,
+                err.get("code"),
+                (err.get("message") or "")[:200],
+            )
+            yield {
+                "event": "error",
+                "code": err.get("code") or "poll_failed",
+                "message": err.get("message"),
+                "details": err,
+            }
+            return
+
+        try:
+            payload = await r.json()
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+        except Exception:
+            items = []
+
+        my = None
+        for it in items:
+            if it.get("task_id") == task_id:
+                my = it
+                break
+
+        if my:
+            _dbg("poll_generation: draft entry keys=%s", list(my.keys()))
+            gen_id = my.get("id")
+            if not found_gen_id and gen_id:
+                found_gen_id = gen_id
+                _dbg("poll_generation: draft found gen_id=%s", found_gen_id)
+                yield {"event": "draft_found", "gen_id": found_gen_id}
+
+            draft_has_error = False
+            code_val = None
+            msg_val = None
+            if my.get("kind") == "sora_error":
+                draft_has_error = True
+                code_val = my.get("error_reason") or my.get("reason")
+                msg_val = my.get("reason_str") or my.get("message")
+            if (
+                my.get("error_reason")
+                or my.get("failure_reason")
+                or my.get("reason")
+                or my.get("reason_str")
+            ) and not (my.get("url") and my.get("encodings")):
+                draft_has_error = True
+                code_val = code_val or my.get("error_reason") or my.get("failure_reason") or my.get("reason")
+                msg_val = msg_val or my.get("reason_str") or my.get("message")
+
+            if draft_has_error:
+                reason = str(code_val or "processing_error")
+                _dbg("poll_generation: detected error draft, reason=%s", reason)
+                yield {
+                    "event": "error",
+                    "code": reason,
+                    "message": (
+                        f"Generation failed: {msg_val}" if msg_val else f"Generation failed: {reason}"
+                    ),
+                    "details": my,
+                    "task_id": task_id,
+                    "gen_id": found_gen_id,
+                }
+                return
+
+            if my.get("url") and my.get("encodings"):
+                if found_gen_id:
+                    _dbg("poll_generation: fetching draft v2 details for %s", found_gen_id)
+                    v2 = await client.get_json(f"/backend/project_y/profile/drafts/v2/{found_gen_id}")
+                    if v2.status == 200:
+                        d = (await v2.json()).get("draft", {})
+                        _dbg("poll_generation: finished (v2) url=%s", d.get("url"))
+                        yield {
+                            "event": "finished",
+                            "gen_id": found_gen_id,
+                            "task_id": task_id,
+                            "url": d.get("url"),
+                            "downloadable_url": d.get("downloadable_url"),
+                            "encodings": d.get("encodings"),
+                            "width": d.get("width"),
+                            "height": d.get("height"),
+                            "prompt": d.get("prompt"),
+                        }
+                        return
+                _dbg("poll_generation: finished (fallback) url=%s", my.get("url"))
+                yield {
+                    "event": "finished",
+                    "gen_id": found_gen_id,
+                    "task_id": task_id,
+                    "url": my.get("url"),
+                    "downloadable_url": my.get("downloadable_url"),
+                    "encodings": my.get("encodings"),
+                    "width": my.get("width"),
+                    "height": my.get("height"),
+                    "prompt": my.get("prompt"),
+                }
+                return
+
+        await asyncio.sleep(poll_interval_sec)
+
+
+async def resume_generation(
+    task_id: str,
+    *,
+    account_id: int,
+    poll_interval_sec: float = 3.0,
+    timeout_sec: float = 900.0,
+    proxy: Optional[str] = None,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Resume polling of an existing generation task."""
+
+    if not task_id:
+        raise ValueError("task_id is required for resume_generation")
+    if int(account_id) <= 0:
+        raise ValueError("account_id must be a positive integer for resume_generation")
+
+    try:
+        from .db import get_account_credentials  # type: ignore
+
+        creds = get_account_credentials(int(account_id))
+    except Exception as e:
+        _dbg("resume_generation: failed to load account credentials: %s", repr(e))
+        creds = None
+
+    if not creds or not creds.get("cookies_json"):
+        yield {
+            "event": "error",
+            "code": "account_missing",
+            "message": "Аккаунт недоступен для продолжения генерации",
+        }
+        return
+
+    client = _AsyncBrowserSession(proxy=proxy, cookies_json=str(creds["cookies_json"]))
+    try:
+        yield {"event": "account", "account_id": int(account_id)}
+        await client._ensure_access_token()
+        yield {"event": "auth", "status": "ok"}
+
+        async for poll_event in _poll_generation(
+            client,
+            str(task_id),
+            poll_interval_sec=poll_interval_sec,
+            timeout_sec=timeout_sec,
+        ):
+            yield poll_event
+    except Exception as e:
+        _dbg("resume_generation: exception: %s", repr(e))
+        yield {"event": "error", "code": "resume_failed", "message": str(e)}
+    finally:
+        if isinstance(client, _AsyncBrowserSession) and client.session and not client.session.closed:
+            _dbg("resume_generation: closing session")
+            await client.session.close()
+        try:
+            from .accounts import mark_generation_finished  # type: ignore
+
+            mark_generation_finished(int(account_id))
+        except Exception as _e:
+            _dbg("resume_generation: failed to mark generation finished: %s", repr(_e))
+
+
 __all__ = [
     "generate_video",
+    "resume_generation",
     "validate_cookies",
 ]
