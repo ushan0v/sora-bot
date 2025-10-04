@@ -1,0 +1,60 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env/ # in case someone made it a dir
+
+# Environment and secrets
+.env
+.env.*
+.python-version
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+eggs/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+
+# Testing and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs and temp
+*.log
+logs/
+tmp/
+temp/
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Databases and local state
+*.db
+*.sqlite3
+
+# Project-specific
+Sora_cite/
+
