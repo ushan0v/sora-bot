@@ -7,7 +7,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
 from utils.accounts import add_account as add_account_into_pool, DuplicateAccountError
-
+from config import ADMIN_ID
 
 router = Router(name="add_account")
 
@@ -16,7 +16,7 @@ class AddAccountState(StatesGroup):
     waiting_for_json = State()
 
 
-@router.message(Command("add_account"))
+@router.message(Command("add_account"), F.from_user.id == ADMIN_ID)
 async def cmd_add_account(message: Message, state: FSMContext) -> None:
     await state.set_state(AddAccountState.waiting_for_json)
     await message.answer(
@@ -32,7 +32,7 @@ async def cmd_add_account(message: Message, state: FSMContext) -> None:
 
 
 
-@router.message(AddAccountState.waiting_for_json, F.document)
+@router.message(AddAccountState.waiting_for_json, F.document, F.from_user.id == ADMIN_ID)
 async def on_document(message: Message, state: FSMContext) -> None:
     doc = message.document
     file_name = (doc.file_name or "").lower()
@@ -67,7 +67,7 @@ async def on_document(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Аккаунт успешно добавлен и будет использоваться для генерации видео.")
 
 
-@router.message(AddAccountState.waiting_for_json)
+@router.message(AddAccountState.waiting_for_json, F.from_user.id == ADMIN_ID)
 async def on_any_other(message: Message, state: FSMContext) -> None:
     # Any non-document while waiting should cancel the state and instruct the user
     await state.clear()

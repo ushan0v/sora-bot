@@ -19,7 +19,6 @@ def create_bot() -> Bot:
 async def setup_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
-            BotCommand(command="settings", description="Открыть настройки"),
-            BotCommand(command="add_account", description="Добавить аккаунт"),
+            BotCommand(command="settings", description="Открыть настройки")
         ]
     )

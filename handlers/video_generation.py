@@ -9,7 +9,7 @@ from aiogram.types.input_file import URLInputFile
 from utils.db import get_user_settings, set_active_generation
 from utils.sora_client import generate_video
 
-from config import PROXY_URL
+from config import PROXY_URL, ADMIN_ID
 
 router = Router(name="video_generation")
 
@@ -19,7 +19,7 @@ async def _start_generation(message: Message, prompt: str, image_bytes: Optional
 
     is_vertical, duration_sec, active, size = get_user_settings(user_id)
 
-    if user_id != 793840080:
+    if user_id != ADMIN_ID:
         if int(active) == 1:
             await message.answer("❗️У вас уже есть активная генерация. Дождитесь завершения.")
             return
@@ -92,7 +92,7 @@ async def _start_generation(message: Message, prompt: str, image_bytes: Optional
                         # Fallback: send as a plain link
                         await message.reply("<b>✅ Видео успешно создано</b>\n\n" + url)
                 else:
-                    await message.reply("❗️ Видео успешно создано, но файл не найден в ответе")
+                    await message.reply("❗️Видео успешно создано, но файл не найден в ответе")
                 return
         # If loop exits without finished or error, treat as unknown failure
         if wait_msg:
@@ -100,7 +100,7 @@ async def _start_generation(message: Message, prompt: str, image_bytes: Optional
                 await wait_msg.delete()
             except Exception:
                 pass
-        await message.reply("🚫 Ошибка генерации: неизвестное состояние")
+        await message.reply("<b>🚫 Ошибка генерации:</b>\n<pre>Неизвестное состояние</pre>")
     finally:
         set_active_generation(user_id, 0)
 
@@ -120,7 +120,7 @@ async def on_photo(message: Message) -> None:
 
     caption = message.caption or ""
     if not caption.strip():
-        await message.reply("Пожалуйста, добавьте подпись к фото — это будет промпт.")
+        await message.reply("❗️Пожалуйста, добавьте подпись к фото — это будет промпт.")
         return
 
     # Скачать фото в память (без сохранения на диск) и передать байты

@@ -13,3 +13,5 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # PROXY_URL is optional; leave empty to disable proxy
 PROXY_URL = os.getenv("PROXY_URL", "")
+
+ADMIN_ID = os.getenv("ADMIN_ID", "")
