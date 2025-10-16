@@ -65,7 +65,7 @@ def get_user_settings(user_id: int) -> Tuple[int, int, int, str]:
         row = cur.fetchone()
         if row is None:
             return 1, 10, 'large'
-        return int(row[0]), int(row[1]), int(row[2])
+        return int(row[0]), int(row[1]), str(row[2])
     finally:
         conn.close()
 
